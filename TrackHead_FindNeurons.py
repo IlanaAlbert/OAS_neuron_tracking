@@ -13,7 +13,7 @@ Stage 1 — Event Picker
   Events are also saved immediately to events_NNN.json.
 
 Stage 2 — Neuron Labeler
-  For each marked event a ±200-frame window opens in the GCaMP channel.
+  For each marked event a ±500-frame window opens in the GCaMP channel.
   Keys 1-5 select the active neuron slot; clicking places/corrects that neuron.
   Positions carry forward from the last clicked frame (interpolation-by-default).
   Results are saved to neurons_NNN_frameXXXXX.npz per event window.
@@ -362,7 +362,8 @@ class EventPickerWindow:
         self.root.bind("<Right>",      lambda e: self._step(1))
         self.root.bind("<Delete>",     lambda e: self._remove_last_event())
         self.root.bind("h",     lambda e: self._toggle_overlay())
-        self.img_canvas.bind("<Button-1>", self._on_canvas_click)
+        self.img_canvas.bind("<Button-1>",  self._on_canvas_click)
+        self.img_canvas.bind("<Configure>", self._on_canvas_resize)
 
     # ─────── virtual timeline helpers ─────────────────────────────────────────
 
@@ -616,15 +617,15 @@ class EventPickerWindow:
 
     def _get_display_image(self, gframe):
         """
-        Return a cached (or freshly rendered) PhotoImage for global `gframe`.
+        Return a cached PIL Image for global `gframe` at DISPLAY_SCALE resolution.
+        The cache stores PIL Images (not PhotoImages) so _show_frame can resize
+        them to fit the canvas at whatever size the window currently is.
         Cache key includes overlay state so toggling refreshes the dot correctly.
-        Overlay dot is composited directly onto the PIL image before conversion,
-        keeping the display path pure PIL/Tk with no matplotlib overhead.
         """
         cache_key = (gframe, self._show_overlay)
         if cache_key in self._img_cache:
             return self._img_cache[cache_key]
-        
+
         fidx, local_frame, list_idx = self._global_to_local(gframe)
         self._ensure_file_open(fidx, list_idx)
 
@@ -633,43 +634,30 @@ class EventPickerWindow:
         else:
             arr = load_behavior_raw(self.bf, local_frame)
 
-        # Convert to PIL RGB for optional dot compositing
-        img = Image.fromarray(arr, mode="L").convert('RGB')
+        # Downsample to DISPLAY_SCALE for the cache (cheap intermediate)
+        thumb_w = max(1, int(arr.shape[1] * DISPLAY_SCALE))
+        thumb_h = max(1, int(arr.shape[0] * DISPLAY_SCALE))
+        img = Image.fromarray(arr, mode="L").convert('RGB').resize(
+            (thumb_w, thumb_h), Image.NEAREST)
 
         # Draw head position dot if overlay is on and a position exists
         if self._show_overlay and gframe in self.head_positions:
             hr, hc = self.head_positions[gframe]
-            # Scale full-res coordinates down to display coordinates
             dr = int(hr * DISPLAY_SCALE)
             dc = int(hc * DISPLAY_SCALE)
-            draw = ImageDraw.Draw(img)
+            draw  = ImageDraw.Draw(img)
             r_dot = max(3, int(6 * DISPLAY_SCALE))
-            # Outer white ring for visibility on any background
-            draw.ellipse([dc - r_dot - 1, dr - r_dot -1,
-                 dc + r_dot + 1, dr + r_dot + 1],
-                 outline=(255,255,255), width=1)
-            # Filled red dot
-            draw.ellipse([dc - r_dot - 1, dr - r_dot -1,
-                 dc + r_dot + 1, dr + r_dot + 1],
-                 fill=(220,60,60))
-            
-        if DISPLAY_SCALE != 1.0:
-            w = max(1, int(img.width * DISPLAY_SCALE) if arr.shape[1] == img.width else img.width)
-            h = max(1, int(img.height * DISPLAY_SCALE) if arr.shape[0] == img.height else img.height)
-            # Image already scaled inside arr_to_photoimage - just convert
-            pass
-        photo = ImageTk.PhotoImage(img.resize(
-            (max(1, int(arr.shape[1] * DISPLAY_SCALE)),
-             max(1, int(arr.shape[0] * DISPLAY_SCALE))),
-             Image.NEAREST
-        ))
+            draw.ellipse([dc-r_dot-1, dr-r_dot-1, dc+r_dot+1, dr+r_dot+1],
+                         outline=(255, 255, 255), width=1)
+            draw.ellipse([dc-r_dot-1, dr-r_dot-1, dc+r_dot+1, dr+r_dot+1],
+                         fill=(220, 60, 60))
 
         # Cap cache size: evict the oldest entry
         if len(self._img_cache) >= self._CACHE_SIZE:
             oldest = next(iter(self._img_cache))
             del self._img_cache[oldest]
-        self._img_cache[gframe] = photo
-        return photo
+        self._img_cache[cache_key] = img
+        return img
 
     def _show_frame(self, gframe):
         self.current_gframe = gframe
@@ -677,27 +665,36 @@ class EventPickerWindow:
 
         fidx, local_frame, list_idx = self._global_to_local(gframe)
 
-        # Update the file indicator label
         fname = os.path.basename(self.file_pairs[list_idx]["b_path"]) or f"[demo {fidx}]"
-        self.file_indicator.config(
-            text=f"file [{fidx:03d} {fname}]"
-        )
-        self.frame_label.config(
-            text=f"global {gframe} / local {local_frame}"
-        )
+        self.file_indicator.config(text=f"file [{fidx:03d} {fname}]")
+        self.frame_label.config(text=f"global {gframe} / local {local_frame}")
 
-        photo = self._get_display_image(gframe)
-        self._tk_img = photo
+        pil_img = self._get_display_image(gframe)
 
-        cw = self.img_canvas.winfo_width()  or 1
-        ch = self.img_canvas.winfo_height() or 1
+        # Fit the image into the current canvas size, preserving aspect ratio
+        cw = self.img_canvas.winfo_width()  or pil_img.width
+        ch = self.img_canvas.winfo_height() or pil_img.height
+        scale = min(cw / pil_img.width, ch / pil_img.height)
+        disp_w = max(1, int(pil_img.width  * scale))
+        disp_h = max(1, int(pil_img.height * scale))
+        fitted = pil_img.resize((disp_w, disp_h), Image.NEAREST)
+
+        photo = ImageTk.PhotoImage(fitted)
+        self._tk_img = photo   # keep reference so GC doesn't collect it
+
         self.img_canvas.delete("all")
-        self.img_canvas.create_image(cw // 2, ch // 2,
-                                     anchor="center", image=photo)
+        self.img_canvas.create_image(cw // 2, ch // 2, anchor="center", image=photo)
 
-        # Highlight if this frame is a marked event
         is_marked = any(e["gframe"] == gframe for e in self.events)
         self.img_canvas.config(bg="#2a0a0a" if is_marked else "black")
+
+    def _on_canvas_resize(self, _event=None):
+        """Redraw current frame when the canvas is resized; debounced to ~60 ms."""
+        if hasattr(self, '_resize_after_id'):
+            self.root.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.root.after(
+            60, lambda: self._show_frame(self.current_gframe)
+        )
 
     @staticmethod
     def _synthetic_beh(local_frame):
@@ -1105,11 +1102,13 @@ class NeuronLabelerWindow:
         self.ax.tick_params(colors="#8892a4")
         for spine in self.ax.spines.values():
             spine.set_edgecolor("#333355")
-        self.fig.tight_layout(pad=1.5)
+        self.fig.set_tight_layout({"pad": 1.5})   # auto-adjusts on every resize
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10)
         self.canvas.mpl_connect("button_press_event", self._on_image_click)
+        self.canvas.mpl_connect("resize_event",
+                                lambda _e: self.canvas.draw_idle())
 
         # ── slider ────────────────────────────────────────────────────────────
         sf = tk.Frame(self.root, bg=PANEL, pady=6)
@@ -1296,7 +1295,6 @@ class NeuronLabelerWindow:
         )
         self.ax.set_facecolor("#0d0d1a")
         self.ax.tick_params(colors="#8892a4")
-        self.fig.tight_layout(pad=1.5)
         self.canvas.draw_idle()
 
     # ── neuron positions ──────────────────────────────────────────────────────
